@@ -1,0 +1,1327 @@
+Project Path: claude-computer-use-macos
+
+Source Tree:
+
+```
+claude-computer-use-macos
+├── screenshots
+├── LICENSE
+├── requirements.txt
+├── computer_use_demo
+│   ├── tools
+│   │   ├── run.py
+│   │   ├── bash.py
+│   │   ├── __init__.py
+│   │   ├── edit.py
+│   │   ├── computer.py
+│   │   ├── collection.py
+│   │   └── base.py
+│   ├── __init__.py
+│   └── loop.py
+├── README.md
+└── main.py
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/LICENSE`:
+
+```
+MIT License
+
+Copyright (c) 2024 Pallav Agarwal
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/requirements.txt`:
+
+```txt
+anthropic[bedrock,vertex]>=0.37.1
+pillow
+PyAutoGUI
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/run.py`:
+
+```py
+"""Utility to run shell commands asynchronously with a timeout."""
+
+import asyncio
+
+TRUNCATED_MESSAGE: str = "<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>"
+MAX_RESPONSE_LEN: int = 16000
+
+
+def maybe_truncate(content: str, truncate_after: int | None = MAX_RESPONSE_LEN):
+    """Truncate content and append a notice if content exceeds the specified length."""
+    return (
+        content
+        if not truncate_after or len(content) <= truncate_after
+        else content[:truncate_after] + TRUNCATED_MESSAGE
+    )
+
+
+async def run(
+    cmd: str,
+    timeout: float | None = 120.0,  # seconds
+    truncate_after: int | None = MAX_RESPONSE_LEN,
+):
+    """Run a shell command asynchronously with a timeout."""
+    process = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        return (
+            process.returncode or 0,
+            maybe_truncate(stdout.decode(), truncate_after=truncate_after),
+            maybe_truncate(stderr.decode(), truncate_after=truncate_after),
+        )
+    except asyncio.TimeoutError as exc:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        raise TimeoutError(
+            f"Command '{cmd}' timed out after {timeout} seconds"
+        ) from exc
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/bash.py`:
+
+```py
+import asyncio
+import os
+from typing import ClassVar, Literal
+
+from anthropic.types.beta import BetaToolBash20241022Param
+
+from .base import BaseAnthropicTool, CLIResult, ToolError, ToolResult
+
+
+class _BashSession:
+    """A session of a bash shell."""
+
+    _started: bool
+    _process: asyncio.subprocess.Process
+
+    command: str = "/bin/bash"
+    _output_delay: float = 0.2  # seconds
+    _timeout: float = 120.0  # seconds
+    _sentinel: str = "<<exit>>"
+
+    def __init__(self):
+        self._started = False
+        self._timed_out = False
+
+    async def start(self):
+        if self._started:
+            return
+
+        self._process = await asyncio.create_subprocess_shell(
+            self.command,
+            preexec_fn=os.setsid,
+            shell=True,
+            bufsize=0,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        self._started = True
+
+    def stop(self):
+        """Terminate the bash shell."""
+        if not self._started:
+            raise ToolError("Session has not started.")
+        if self._process.returncode is not None:
+            return
+        self._process.terminate()
+
+    async def run(self, command: str):
+        """Execute a command in the bash shell."""
+        if not self._started:
+            raise ToolError("Session has not started.")
+        if self._process.returncode is not None:
+            return ToolResult(
+                system="tool must be restarted",
+                error=f"bash has exited with returncode {self._process.returncode}",
+            )
+        if self._timed_out:
+            raise ToolError(
+                f"timed out: bash has not returned in {self._timeout} seconds and must be restarted",
+            )
+
+        # we know these are not None because we created the process with PIPEs
+        assert self._process.stdin
+        assert self._process.stdout
+        assert self._process.stderr
+
+        # send command to the process
+        self._process.stdin.write(
+            command.encode() + f"; echo '{self._sentinel}'\n".encode()
+        )
+        await self._process.stdin.drain()
+
+        # read output from the process, until the sentinel is found
+        try:
+            async with asyncio.timeout(self._timeout):
+                while True:
+                    await asyncio.sleep(self._output_delay)
+                    # if we read directly from stdout/stderr, it will wait forever for
+                    # EOF. use the StreamReader buffer directly instead.
+                    output = (
+                        self._process.stdout._buffer.decode()  # pyright: ignore[reportAttributeAccessIssue]
+                    )
+                    if self._sentinel in output:
+                        # strip the sentinel and break
+                        output = output[: output.index(self._sentinel)]
+                        break
+        except asyncio.TimeoutError:
+            self._timed_out = True
+            raise ToolError(
+                f"timed out: bash has not returned in {self._timeout} seconds and must be restarted",
+            ) from None
+
+        if output.endswith("\n"):
+            output = output[:-1]
+
+        error = (
+            self._process.stderr._buffer.decode()  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        if error.endswith("\n"):
+            error = error[:-1]
+
+        # clear the buffers so that the next output can be read correctly
+        self._process.stdout._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
+        self._process.stderr._buffer.clear()  # pyright: ignore[reportAttributeAccessIssue]
+
+        return CLIResult(output=output, error=error)
+
+
+class BashTool(BaseAnthropicTool):
+    """
+    A tool that allows the agent to run bash commands.
+    The tool parameters are defined by Anthropic and are not editable.
+    """
+
+    _session: _BashSession | None
+    name: ClassVar[Literal["bash"]] = "bash"
+    api_type: ClassVar[Literal["bash_20241022"]] = "bash_20241022"
+
+    def __init__(self):
+        self._session = None
+        super().__init__()
+
+    async def __call__(
+        self, command: str | None = None, restart: bool = False, **kwargs
+    ):
+        print("### Running bash command:", command)
+        if restart:
+            if self._session:
+                self._session.stop()
+            self._session = _BashSession()
+            await self._session.start()
+
+            return ToolResult(system="tool has been restarted.")
+
+        if self._session is None:
+            self._session = _BashSession()
+            await self._session.start()
+
+        if command is not None:
+            return await self._session.run(command)
+
+        raise ToolError("no command provided.")
+
+    def to_params(self) -> BetaToolBash20241022Param:
+        return {
+            "type": self.api_type,
+            "name": self.name,
+        }
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/__init__.py`:
+
+```py
+from .base import CLIResult, ToolResult
+from .bash import BashTool
+from .collection import ToolCollection
+from .computer import ComputerTool
+from .edit import EditTool
+
+__ALL__ = [
+    BashTool,
+    CLIResult,
+    ComputerTool,
+    EditTool,
+    ToolCollection,
+    ToolResult,
+]
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/edit.py`:
+
+```py
+from collections import defaultdict
+from pathlib import Path
+from typing import Literal, get_args
+
+from anthropic.types.beta import BetaToolTextEditor20241022Param
+
+from .base import BaseAnthropicTool, CLIResult, ToolError, ToolResult
+from .run import maybe_truncate, run
+
+Command = Literal[
+    "view",
+    "create",
+    "str_replace",
+    "insert",
+    "undo_edit",
+]
+SNIPPET_LINES: int = 4
+
+
+class EditTool(BaseAnthropicTool):
+    """
+    An filesystem editor tool that allows the agent to view, create, and edit files.
+    The tool parameters are defined by Anthropic and are not editable.
+    """
+
+    api_type: Literal["text_editor_20241022"] = "text_editor_20241022"
+    name: Literal["str_replace_editor"] = "str_replace_editor"
+
+    _file_history: dict[Path, list[str]]
+
+    def __init__(self):
+        self._file_history = defaultdict(list)
+        super().__init__()
+
+    def to_params(self) -> BetaToolTextEditor20241022Param:
+        return {
+            "name": self.name,
+            "type": self.api_type,
+        }
+
+    async def __call__(
+        self,
+        *,
+        command: Command,
+        path: str,
+        file_text: str | None = None,
+        view_range: list[int] | None = None,
+        old_str: str | None = None,
+        new_str: str | None = None,
+        insert_line: int | None = None,
+        **kwargs,
+    ):
+        _path = Path(path)
+        self.validate_path(command, _path)
+        if command == "view":
+            return await self.view(_path, view_range)
+        elif command == "create":
+            if not file_text:
+                raise ToolError("Parameter `file_text` is required for command: create")
+            self.write_file(_path, file_text)
+            self._file_history[_path].append(file_text)
+            return ToolResult(output=f"File created successfully at: {_path}")
+        elif command == "str_replace":
+            if not old_str:
+                raise ToolError(
+                    "Parameter `old_str` is required for command: str_replace"
+                )
+            return self.str_replace(_path, old_str, new_str)
+        elif command == "insert":
+            if insert_line is None:
+                raise ToolError(
+                    "Parameter `insert_line` is required for command: insert"
+                )
+            if not new_str:
+                raise ToolError("Parameter `new_str` is required for command: insert")
+            return self.insert(_path, insert_line, new_str)
+        elif command == "undo_edit":
+            return self.undo_edit(_path)
+        raise ToolError(
+            f'Unrecognized command {command}. The allowed commands for the {self.name} tool are: {", ".join(get_args(Command))}'
+        )
+
+    def validate_path(self, command: str, path: Path):
+        """
+        Check that the path/command combination is valid.
+        """
+        # Check if its an absolute path
+        if not path.is_absolute():
+            suggested_path = Path("") / path
+            raise ToolError(
+                f"The path {path} is not an absolute path, it should start with `/`. Maybe you meant {suggested_path}?"
+            )
+        # Check if path exists
+        if not path.exists() and command != "create":
+            raise ToolError(
+                f"The path {path} does not exist. Please provide a valid path."
+            )
+        if path.exists() and command == "create":
+            raise ToolError(
+                f"File already exists at: {path}. Cannot overwrite files using command `create`."
+            )
+        # Check if the path points to a directory
+        if path.is_dir():
+            if command != "view":
+                raise ToolError(
+                    f"The path {path} is a directory and only the `view` command can be used on directories"
+                )
+
+    async def view(self, path: Path, view_range: list[int] | None = None):
+        """Implement the view command"""
+        if path.is_dir():
+            if view_range:
+                raise ToolError(
+                    "The `view_range` parameter is not allowed when `path` points to a directory."
+                )
+
+            _, stdout, stderr = await run(
+                rf"find {path} -maxdepth 2 -not -path '*/\.*'"
+            )
+            if not stderr:
+                stdout = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
+            return CLIResult(output=stdout, error=stderr)
+
+        file_content = self.read_file(path)
+        init_line = 1
+        if view_range:
+            if len(view_range) != 2 or not all(isinstance(i, int) for i in view_range):
+                raise ToolError(
+                    "Invalid `view_range`. It should be a list of two integers."
+                )
+            file_lines = file_content.split("\n")
+            n_lines_file = len(file_lines)
+            init_line, final_line = view_range
+            if init_line < 1 or init_line > n_lines_file:
+                raise ToolError(
+                    f"Invalid `view_range`: {view_range}. It's first element `{init_line}` should be within the range of lines of the file: {[1, n_lines_file]}"
+                )
+            if final_line > n_lines_file:
+                raise ToolError(
+                    f"Invalid `view_range`: {view_range}. It's second element `{final_line}` should be smaller than the number of lines in the file: `{n_lines_file}`"
+                )
+            if final_line != -1 and final_line < init_line:
+                raise ToolError(
+                    f"Invalid `view_range`: {view_range}. It's second element `{final_line}` should be larger or equal than its first `{init_line}`"
+                )
+
+            if final_line == -1:
+                file_content = "\n".join(file_lines[init_line - 1 :])
+            else:
+                file_content = "\n".join(file_lines[init_line - 1 : final_line])
+
+        return CLIResult(
+            output=self._make_output(file_content, str(path), init_line=init_line)
+        )
+
+    def str_replace(self, path: Path, old_str: str, new_str: str | None):
+        """Implement the str_replace command, which replaces old_str with new_str in the file content"""
+        # Read the file content
+        file_content = self.read_file(path).expandtabs()
+        old_str = old_str.expandtabs()
+        new_str = new_str.expandtabs() if new_str is not None else ""
+
+        # Check if old_str is unique in the file
+        occurrences = file_content.count(old_str)
+        if occurrences == 0:
+            raise ToolError(
+                f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}."
+            )
+        elif occurrences > 1:
+            file_content_lines = file_content.split("\n")
+            lines = [
+                idx + 1
+                for idx, line in enumerate(file_content_lines)
+                if old_str in line
+            ]
+            raise ToolError(
+                f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {lines}. Please ensure it is unique"
+            )
+
+        # Replace old_str with new_str
+        new_file_content = file_content.replace(old_str, new_str)
+
+        # Write the new content to the file
+        self.write_file(path, new_file_content)
+
+        # Save the content to history
+        self._file_history[path].append(file_content)
+
+        # Create a snippet of the edited section
+        replacement_line = file_content.split(old_str)[0].count("\n")
+        start_line = max(0, replacement_line - SNIPPET_LINES)
+        end_line = replacement_line + SNIPPET_LINES + new_str.count("\n")
+        snippet = "\n".join(new_file_content.split("\n")[start_line : end_line + 1])
+
+        # Prepare the success message
+        success_msg = f"The file {path} has been edited. "
+        success_msg += self._make_output(
+            snippet, f"a snippet of {path}", start_line + 1
+        )
+        success_msg += "Review the changes and make sure they are as expected. Edit the file again if necessary."
+
+        return CLIResult(output=success_msg)
+
+    def insert(self, path: Path, insert_line: int, new_str: str):
+        """Implement the insert command, which inserts new_str at the specified line in the file content."""
+        file_text = self.read_file(path).expandtabs()
+        new_str = new_str.expandtabs()
+        file_text_lines = file_text.split("\n")
+        n_lines_file = len(file_text_lines)
+
+        if insert_line < 0 or insert_line > n_lines_file:
+            raise ToolError(
+                f"Invalid `insert_line` parameter: {insert_line}. It should be within the range of lines of the file: {[0, n_lines_file]}"
+            )
+
+        new_str_lines = new_str.split("\n")
+        new_file_text_lines = (
+            file_text_lines[:insert_line]
+            + new_str_lines
+            + file_text_lines[insert_line:]
+        )
+        snippet_lines = (
+            file_text_lines[max(0, insert_line - SNIPPET_LINES) : insert_line]
+            + new_str_lines
+            + file_text_lines[insert_line : insert_line + SNIPPET_LINES]
+        )
+
+        new_file_text = "\n".join(new_file_text_lines)
+        snippet = "\n".join(snippet_lines)
+
+        self.write_file(path, new_file_text)
+        self._file_history[path].append(file_text)
+
+        success_msg = f"The file {path} has been edited. "
+        success_msg += self._make_output(
+            snippet,
+            "a snippet of the edited file",
+            max(1, insert_line - SNIPPET_LINES + 1),
+        )
+        success_msg += "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."
+        return CLIResult(output=success_msg)
+
+    def undo_edit(self, path: Path):
+        """Implement the undo_edit command."""
+        if not self._file_history[path]:
+            raise ToolError(f"No edit history found for {path}.")
+
+        old_text = self._file_history[path].pop()
+        self.write_file(path, old_text)
+
+        return CLIResult(
+            output=f"Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}"
+        )
+
+    def read_file(self, path: Path):
+        """Read the content of a file from a given path; raise a ToolError if an error occurs."""
+        try:
+            return path.read_text()
+        except Exception as e:
+            raise ToolError(f"Ran into {e} while trying to read {path}") from None
+
+    def write_file(self, path: Path, file: str):
+        """Write the content of a file to a given path; raise a ToolError if an error occurs."""
+        try:
+            path.write_text(file)
+        except Exception as e:
+            raise ToolError(f"Ran into {e} while trying to write to {path}") from None
+
+    def _make_output(
+        self,
+        file_content: str,
+        file_descriptor: str,
+        init_line: int = 1,
+        expand_tabs: bool = True,
+    ):
+        """Generate output for the CLI based on the content of a file."""
+        file_content = maybe_truncate(file_content)
+        if expand_tabs:
+            file_content = file_content.expandtabs()
+        file_content = "\n".join(
+            [
+                f"{i + init_line:6}\t{line}"
+                for i, line in enumerate(file_content.split("\n"))
+            ]
+        )
+        return (
+            f"Here's the result of running `cat -n` on {file_descriptor}:\n"
+            + file_content
+            + "\n"
+        )
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/computer.py`:
+
+```py
+import asyncio
+import base64
+import io
+from enum import StrEnum
+from typing import Literal, TypedDict
+import pyautogui
+from anthropic.types.beta import BetaToolComputerUse20241022Param
+
+from .base import BaseAnthropicTool, ToolError, ToolResult
+
+OUTPUT_DIR = "/tmp/outputs"
+
+TYPING_DELAY_MS = 12
+TYPING_GROUP_SIZE = 50
+
+Action = Literal[
+    "key",
+    "type",
+    "mouse_move",
+    "left_click",
+    "left_click_drag",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "screenshot",
+    "cursor_position",
+]
+
+
+class ScalingSource(StrEnum):
+    COMPUTER = "computer"
+    API = "api"
+
+
+class ComputerToolOptions(TypedDict):
+    display_height_px: int
+    display_width_px: int
+    display_number: int | None
+
+
+def chunks(s: str, chunk_size: int) -> list[str]:
+    return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
+
+
+class ComputerTool(BaseAnthropicTool):
+    """
+    A tool that allows the agent to interact with the screen, keyboard, and mouse of the current computer.
+    The tool parameters are defined by Anthropic and are not editable.
+    """
+
+    name: Literal["computer"] = "computer"
+    api_type: Literal["computer_20241022"] = "computer_20241022"
+    width: int
+    height: int
+    display_num: int | None
+
+    _screenshot_delay = 1.0
+    _scaling_enabled = True
+
+    @property
+    def options(self) -> ComputerToolOptions:
+        return {
+            "display_width_px": self.target_width,
+            "display_height_px": self.target_height,
+            "display_number": self.display_num,
+        }
+
+    def to_params(self) -> BetaToolComputerUse20241022Param:
+        return {"name": self.name, "type": self.api_type, **self.options}
+
+    def __init__(self):
+        super().__init__()
+
+        self.width = int(pyautogui.size()[0])
+        self.height = int(pyautogui.size()[1])
+
+        self.display_num = None  # Not used on MacOS
+
+        MAX_WIDTH = 1280  # Max screenshot width
+        if self.width > MAX_WIDTH:
+            self.scale_factor = MAX_WIDTH / self.width
+            self.target_width = MAX_WIDTH
+            self.target_height = int(self.height * self.scale_factor)
+        else:
+            self.scale_factor = 1.0
+            self.target_width = self.width
+            self.target_height = self.height
+
+    async def __call__(
+        self,
+        *,
+        action: Action,
+        text: str | None = None,
+        coordinate: list[int] | None = None,
+        **kwargs,
+    ):
+        print(
+            f"### Performing action: {action}{f", text: {text}" if text else ''}{f", coordinate: {coordinate}" if coordinate else ''}"
+        )
+        if action in ("mouse_move", "left_click_drag"):
+            if coordinate is None:
+                raise ToolError(f"coordinate is required for {action}")
+            if text is not None:
+                raise ToolError(f"text is not accepted for {action}")
+            if not isinstance(coordinate, list) or len(coordinate) != 2:
+                raise ToolError(f"coordinate must be a list of length 2")
+            if not all(isinstance(i, int) and i >= 0 for i in coordinate):
+                raise ToolError(f"coordinate must be a list of non-negative integers")
+
+            x, y = self.scale_coordinates(
+                ScalingSource.API, coordinate[0], coordinate[1]
+            )
+
+            if action == "mouse_move":
+                await asyncio.to_thread(pyautogui.moveTo, x, y)
+                return ToolResult(output=f"Mouse moved successfully to X={x}, Y={y}")
+            elif action == "left_click_drag":
+                await asyncio.to_thread(pyautogui.mouseDown)
+                await asyncio.to_thread(pyautogui.moveTo, x, y)
+                await asyncio.to_thread(pyautogui.mouseUp)
+                return ToolResult(output="Mouse drag action completed.")
+
+        if action in ("key", "type"):
+            if text is None:
+                raise ToolError(f"text is required for {action}")
+            if coordinate is not None:
+                raise ToolError(f"coordinate is not accepted for {action}")
+            if not isinstance(text, str):
+                raise ToolError(f"text must be a string")
+
+            if action == "key":
+                # Handle key combinations and modifiers
+                # Replace 'super' with 'command'
+                key_sequence = text.lower().replace("super", "command").split("+")
+                key_sequence = [key.strip() for key in key_sequence]
+                # Map 'cmd' to 'command' for MacOS
+                key_sequence = [
+                    "command" if key == "cmd" else key for key in key_sequence
+                ]
+                # Handle special keys that pyautogui expects
+                special_keys = {
+                    "ctrl": "ctrl",
+                    "control": "ctrl",
+                    "alt": "alt",
+                    "option": "alt",
+                    "shift": "shift",
+                    "command": "command",
+                    "tab": "tab",
+                    "enter": "enter",
+                    "return": "enter",
+                    "esc": "esc",
+                    "escape": "esc",
+                    "space": "space",
+                    "spacebar": "space",
+                    "up": "up",
+                    "down": "down",
+                    "left": "left",
+                    "right": "right",
+                    # Add more special keys as needed
+                }
+                key_sequence = [special_keys.get(key, key) for key in key_sequence]
+                await asyncio.to_thread(pyautogui.hotkey, *key_sequence)
+                return ToolResult(output=f"Key combination '{text}' pressed.")
+            elif action == "type":
+                await asyncio.to_thread(
+                    pyautogui.write, text, interval=TYPING_DELAY_MS / 1000.0
+                )
+                return ToolResult(output=f"Typed text: {text}")
+
+        if action in (
+            "left_click",
+            "right_click",
+            "double_click",
+            "screenshot",
+            "cursor_position",
+        ):
+            if text is not None:
+                raise ToolError(f"text is not accepted for {action}")
+            if coordinate is not None:
+                raise ToolError(f"coordinate is not accepted for {action}")
+
+            if action == "screenshot":
+                return await self.screenshot()
+            elif action == "cursor_position":
+                x, y = pyautogui.position()
+                x, y = self.scale_coordinates(ScalingSource.COMPUTER, int(x), int(y))
+                return ToolResult(output=f"X={x},Y={y}")
+            else:
+                if action == "left_click":
+                    await asyncio.to_thread(pyautogui.click, button="left")
+                    return ToolResult(output="Left click performed.")
+                elif action == "right_click":
+                    await asyncio.to_thread(pyautogui.click, button="right")
+                    return ToolResult(output="Right click performed.")
+                elif action == "double_click":
+                    await asyncio.to_thread(pyautogui.doubleClick)
+                    return ToolResult(output="Double click performed.")
+
+        raise ToolError(f"Invalid action: {action}")
+
+    async def screenshot(self):
+        """Take a screenshot of the current screen and return the base64 encoded image."""
+        # Capture screenshot using PyAutoGUI
+        screenshot = await asyncio.to_thread(pyautogui.screenshot)
+
+        if self._scaling_enabled and self.scale_factor < 1.0:
+            screenshot = screenshot.resize((self.target_width, self.target_height))
+
+        img_buffer = io.BytesIO()
+        # Save the image to an in-memory buffer
+        screenshot.save(img_buffer, format="PNG", optimize=True)
+        img_buffer.seek(0)
+        base64_image = base64.b64encode(img_buffer.read()).decode()
+
+        return ToolResult(base64_image=base64_image)
+
+    def scale_coordinates(self, source: ScalingSource, x: int, y: int):
+        """Scale coordinates between the assistant's coordinate system and the real screen coordinates."""
+        if not self._scaling_enabled:
+            return x, y
+        x_scaling_factor = self.width / self.target_width
+        y_scaling_factor = self.height / self.target_height
+        if source == ScalingSource.API:
+            # Assistant's coordinates -> real screen coordinates
+            return round(x * x_scaling_factor), round(y * y_scaling_factor)
+        else:
+            # Real screen coordinates -> assistant's coordinate system
+            return round(x / x_scaling_factor), round(y / y_scaling_factor)
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/collection.py`:
+
+```py
+"""Collection classes for managing multiple tools."""
+
+from typing import Any
+
+from anthropic.types.beta import BetaToolUnionParam
+
+from .base import (
+    BaseAnthropicTool,
+    ToolError,
+    ToolFailure,
+    ToolResult,
+)
+
+
+class ToolCollection:
+    """A collection of anthropic-defined tools."""
+
+    def __init__(self, *tools: BaseAnthropicTool):
+        self.tools = tools
+        self.tool_map = {tool.to_params()["name"]: tool for tool in tools}
+
+    def to_params(
+        self,
+    ) -> list[BetaToolUnionParam]:
+        return [tool.to_params() for tool in self.tools]
+
+    async def run(self, *, name: str, tool_input: dict[str, Any]) -> ToolResult:
+        tool = self.tool_map.get(name)
+        if not tool:
+            return ToolFailure(error=f"Tool {name} is invalid")
+        try:
+            return await tool(**tool_input)
+        except ToolError as e:
+            return ToolFailure(error=e.message)
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/tools/base.py`:
+
+```py
+from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass, fields, replace
+from typing import Any
+
+from anthropic.types.beta import BetaToolUnionParam
+
+
+class BaseAnthropicTool(metaclass=ABCMeta):
+    """Abstract base class for Anthropic-defined tools."""
+
+    @abstractmethod
+    def __call__(self, **kwargs) -> Any:
+        """Executes the tool with the given arguments."""
+        ...
+
+    @abstractmethod
+    def to_params(
+        self,
+    ) -> BetaToolUnionParam:
+        raise NotImplementedError
+
+
+@dataclass(kw_only=True, frozen=True)
+class ToolResult:
+    """Represents the result of a tool execution."""
+
+    output: str | None = None
+    error: str | None = None
+    base64_image: str | None = None
+    system: str | None = None
+
+    def __bool__(self):
+        return any(getattr(self, field.name) for field in fields(self))
+
+    def __add__(self, other: "ToolResult"):
+        def combine_fields(
+            field: str | None, other_field: str | None, concatenate: bool = True
+        ):
+            if field and other_field:
+                if concatenate:
+                    return field + other_field
+                raise ValueError("Cannot combine tool results")
+            return field or other_field
+
+        return ToolResult(
+            output=combine_fields(self.output, other.output),
+            error=combine_fields(self.error, other.error),
+            base64_image=combine_fields(self.base64_image, other.base64_image, False),
+            system=combine_fields(self.system, other.system),
+        )
+
+    def replace(self, **kwargs):
+        """Returns a new ToolResult with the given fields replaced."""
+        return replace(self, **kwargs)
+
+
+class CLIResult(ToolResult):
+    """A ToolResult that can be rendered as a CLI output."""
+
+
+class ToolFailure(ToolResult):
+    """A ToolResult that represents a failure."""
+
+
+class ToolError(Exception):
+    """Raised when a tool encounters an error."""
+
+    def __init__(self, message):
+        self.message = message
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/computer_use_demo/loop.py`:
+
+```py
+"""
+Agentic sampling loop that calls the Anthropic API and local implenmentation of anthropic-defined computer use tools.
+"""
+
+import platform
+from collections.abc import Callable
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, cast
+
+from anthropic import Anthropic, AnthropicBedrock, AnthropicVertex, APIResponse
+from anthropic.types import (
+    ToolResultBlockParam,
+)
+from anthropic.types.beta import (
+    BetaContentBlock,
+    BetaContentBlockParam,
+    BetaImageBlockParam,
+    BetaMessage,
+    BetaMessageParam,
+    BetaTextBlockParam,
+    BetaToolResultBlockParam,
+)
+
+from .tools import BashTool, ComputerTool, EditTool, ToolCollection, ToolResult
+
+BETA_FLAG = "computer-use-2024-10-22"
+
+
+class APIProvider(StrEnum):
+    ANTHROPIC = "anthropic"
+    BEDROCK = "bedrock"
+    VERTEX = "vertex"
+
+
+PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
+    APIProvider.ANTHROPIC: "claude-3-5-sonnet-20241022",
+    APIProvider.BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    APIProvider.VERTEX: "claude-3-5-sonnet-v2@20241022",
+}
+
+
+# This system prompt is optimized for the Docker environment in this repository and
+# specific tool combinations enabled.
+# We encourage modifying this system prompt to ensure the model has context for the
+# environment it is running in, and to provide any additional information that may be
+# helpful for the task at hand.
+SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
+* You are utilizing a MacOS computer using {platform.machine()} architecture with internet access.
+* You can use the bash tool to execute commands in the terminal.
+* To open applications, you can use the `open` command in the bash tool. For example, `open -a Safari` to open the Safari browser.
+* When using your bash tool with commands that are expected to output very large quantities of text, redirect the output into a temporary file and use `str_replace_editor` or `grep -n -B <lines before> -A <lines after> <query> <filename>` to inspect the output.
+* When viewing a page, it can be helpful to zoom out so that you can see everything on the page. Alternatively, ensure you scroll down to see everything before deciding something isn't available.
+* When using your computer function calls, they may take a while to run and send back to you. Where possible and feasible, try to chain multiple of these calls into one function call request.
+* The current date is {datetime.today().strftime('%A, %B %-d, %Y')}.
+</SYSTEM_CAPABILITY>
+
+<IMPORTANT>
+* When using Safari or other applications, if any startup wizards or prompts appear, **IGNORE THEM**. Do not interact with them. Instead, click on the address bar or the area where you can enter commands or URLs, and proceed with your task.
+* If the item you are looking at is a PDF, and after taking a single screenshot of the PDF it seems you want to read the entire document, instead of trying to continue to read the PDF from your screenshots and navigation, determine the URL, use `curl` to download the PDF, install and use `pdftotext` (you may need to install it via `brew install poppler`) to convert it to a text file, and then read that text file directly with your `str_replace_editor` tool.
+</IMPORTANT>"""
+
+
+async def sampling_loop(
+    *,
+    model: str,
+    provider: APIProvider,
+    system_prompt_suffix: str,
+    messages: list[BetaMessageParam],
+    output_callback: Callable[[BetaContentBlock], None],
+    tool_output_callback: Callable[[ToolResult, str], None],
+    api_response_callback: Callable[[APIResponse[BetaMessage]], None],
+    api_key: str,
+    only_n_most_recent_images: int | None = None,
+    max_tokens: int = 4096,
+):
+    """
+    Agentic sampling loop for the assistant/tool interaction of computer use.
+    """
+    tool_collection = ToolCollection(
+        ComputerTool(),
+        BashTool(),
+        EditTool(),
+    )
+    system = (
+        f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}"
+    )
+
+    while True:
+        if only_n_most_recent_images:
+            _maybe_filter_to_n_most_recent_images(messages, only_n_most_recent_images)
+
+        if provider == APIProvider.ANTHROPIC:
+            client = Anthropic(api_key=api_key)
+        elif provider == APIProvider.VERTEX:
+            client = AnthropicVertex()
+        elif provider == APIProvider.BEDROCK:
+            client = AnthropicBedrock()
+
+        # Call the API
+        # we use raw_response to provide debug information to streamlit. Your
+        # implementation may be able call the SDK directly with:
+        # `response = client.messages.create(...)` instead.
+        raw_response = client.beta.messages.with_raw_response.create(
+            max_tokens=max_tokens,
+            messages=messages,
+            model=model,
+            system=system,
+            tools=tool_collection.to_params(),
+            betas=["computer-use-2024-10-22"],
+        )
+
+        api_response_callback(cast(APIResponse[BetaMessage], raw_response))
+
+        response = raw_response.parse()
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": cast(list[BetaContentBlockParam], response.content),
+            }
+        )
+
+        tool_result_content: list[BetaToolResultBlockParam] = []
+        for content_block in cast(list[BetaContentBlock], response.content):
+            output_callback(content_block)
+            if content_block.type == "tool_use":
+                result = await tool_collection.run(
+                    name=content_block.name,
+                    tool_input=cast(dict[str, Any], content_block.input),
+                )
+                tool_result_content.append(
+                    _make_api_tool_result(result, content_block.id)
+                )
+                tool_output_callback(result, content_block.id)
+
+        if not tool_result_content:
+            return messages
+
+        messages.append({"content": tool_result_content, "role": "user"})
+
+
+def _maybe_filter_to_n_most_recent_images(
+    messages: list[BetaMessageParam],
+    images_to_keep: int,
+    min_removal_threshold: int = 10,
+):
+    """
+    With the assumption that images are screenshots that are of diminishing value as
+    the conversation progresses, remove all but the final `images_to_keep` tool_result
+    images in place, with a chunk of min_removal_threshold to reduce the amount we
+    break the implicit prompt cache.
+    """
+    if images_to_keep is None:
+        return messages
+
+    tool_result_blocks = cast(
+        list[ToolResultBlockParam],
+        [
+            item
+            for message in messages
+            for item in (
+                message["content"] if isinstance(message["content"], list) else []
+            )
+            if isinstance(item, dict) and item.get("type") == "tool_result"
+        ],
+    )
+
+    total_images = sum(
+        1
+        for tool_result in tool_result_blocks
+        for content in tool_result.get("content", [])
+        if isinstance(content, dict) and content.get("type") == "image"
+    )
+
+    images_to_remove = total_images - images_to_keep
+    # for better cache behavior, we want to remove in chunks
+    images_to_remove -= images_to_remove % min_removal_threshold
+
+    for tool_result in tool_result_blocks:
+        if isinstance(tool_result.get("content"), list):
+            new_content = []
+            for content in tool_result.get("content", []):
+                if isinstance(content, dict) and content.get("type") == "image":
+                    if images_to_remove > 0:
+                        images_to_remove -= 1
+                        continue
+                new_content.append(content)
+            tool_result["content"] = new_content
+
+
+def _make_api_tool_result(
+    result: ToolResult, tool_use_id: str
+) -> BetaToolResultBlockParam:
+    """Convert an agent ToolResult to an API ToolResultBlockParam."""
+    tool_result_content: list[BetaTextBlockParam | BetaImageBlockParam] | str = []
+    is_error = False
+    if result.error:
+        is_error = True
+        tool_result_content = _maybe_prepend_system_tool_result(result, result.error)
+    else:
+        if result.output:
+            tool_result_content.append(
+                {
+                    "type": "text",
+                    "text": _maybe_prepend_system_tool_result(result, result.output),
+                }
+            )
+        if result.base64_image:
+            tool_result_content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": result.base64_image,
+                    },
+                }
+            )
+    return {
+        "type": "tool_result",
+        "content": tool_result_content,
+        "tool_use_id": tool_use_id,
+        "is_error": is_error,
+    }
+
+
+def _maybe_prepend_system_tool_result(result: ToolResult, result_text: str):
+    if result.system:
+        result_text = f"<system>{result.system}</system>\n{result_text}"
+    return result_text
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/README.md`:
+
+```md
+# Claude Computer Use Demo for MacOS
+
+This repository contains a Python script that demonstrates Anthropic's Computer Use capabilities, modified to run on MacOS without requiring a Docker container. The script allows Claude 3.5 Sonnet to perform tasks on your Mac by simulating mouse and keyboard actions as well as running bash command.
+
+Forked from Anthropic's [computer use demo](https://github.com/anthropics/anthropic-quickstarts/tree/main/computer-use-demo) - optimized for MacOS.
+View Anthropic's docs [here](https://docs.anthropic.com/en/docs/build-with-claude/computer-use).
+
+> [!WARNING]  
+> Use this script with caution. Allowing Claude to control your computer can be risky. By running this script, you assume all responsibility and liability.
+
+## Installation and Setup
+
+1. **Clone the repository:**
+
+   ```bash
+   git clone https://github.com/PallavAg/claude-computer-use-macos.git
+   cd claude-computer-use-macos
+   ```
+
+2. **Create a virtual environment + install dependencies:**
+
+   ```bash
+   python3.12 -m venv venv
+   source venv/bin/activate
+   pip3.12 install -r requirements.txt
+   ```
+
+3. **Set your Anthropic API key as an environment variable:**
+
+   ```bash
+   export ANTHROPIC_API_KEY="CLAUDE_API_KEY"
+   ```
+
+   Replace `CLAUDE_API_KEY` with your actual Anthropic API key. You find yours [here](https://console.anthropic.com/settings/keys).
+
+4. **Grant Accessibility Permissions:**
+
+   The script uses `pyautogui` to control mouse and keyboard events. On MacOS, you need to grant accessibility permissions. These popups should show automatically the first time you run the script so you can skip this step. But to manually provide permissions:
+
+   - Go to **System Preferences** > **Security & Privacy** > **Privacy** tab.
+   - Select **Accessibility** from the list on the left.
+   - Add your terminal application or Python interpreter to the list of allowed apps.
+
+## Usage
+
+You can run the script by passing the instruction directly via the command line or by editing the `main.py` file.
+
+**Example using command line instruction:**
+
+```bash
+python3.12 main.py 'Open Safari and look up Anthropic'
+```
+
+Replace `'Open Safari and look up Anthropic'` with your desired instruction.
+
+**Note:** If you do not provide an instruction via the command line, the script will use the default instruction specified in `main.py`. You can edit `main.py` to change this default instruction.
+
+## Exiting the Script
+
+You can quit the script at any time by pressing `Ctrl+C` in the terminal.
+
+## ⚠ Disclaimer
+
+> [!CAUTION]
+> - **Security Risks:** This script allows claude to control your computer's mouse and keyboard and run bash commands. Use it at your own risk.
+> - **Responsibility:** By running this script, you assume all responsibility and liability for any results.
+
+```
+
+`/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/main.py`:
+
+```py
+import asyncio
+import os
+import sys
+import json
+import base64
+
+from computer_use_demo.loop import sampling_loop, APIProvider
+from computer_use_demo.tools import ToolResult
+from anthropic.types.beta import BetaMessage, BetaMessageParam
+from anthropic import APIResponse
+
+
+async def main():
+    # Set up your Anthropic API key and model
+    api_key = os.getenv("ANTHROPIC_API_KEY", "YOUR_API_KEY_HERE")
+    if api_key == "YOUR_API_KEY_HERE":
+        raise ValueError(
+            "Please first set your API key in the ANTHROPIC_API_KEY environment variable"
+        )
+    provider = APIProvider.ANTHROPIC
+
+    # Check if the instruction is provided via command line arguments
+    if len(sys.argv) > 1:
+        instruction = " ".join(sys.argv[1:])
+    else:
+        instruction = "Save an image of a cat to the desktop."
+
+    print(
+        f"Starting Claude 'Computer Use'.\nPress ctrl+c to stop.\nInstructions provided: '{instruction}'"
+    )
+
+    # Set up the initial messages
+    messages: list[BetaMessageParam] = [
+        {
+            "role": "user",
+            "content": instruction,
+        }
+    ]
+
+    # Define callbacks (you can customize these)
+    def output_callback(content_block):
+        if isinstance(content_block, dict) and content_block.get("type") == "text":
+            print("Assistant:", content_block.get("text"))
+
+    def tool_output_callback(result: ToolResult, tool_use_id: str):
+        if result.output:
+            print(f"> Tool Output [{tool_use_id}]:", result.output)
+        if result.error:
+            print(f"!!! Tool Error [{tool_use_id}]:", result.error)
+        if result.base64_image:
+            # Save the image to a file if needed
+            os.makedirs("screenshots", exist_ok=True)
+            image_data = result.base64_image
+            with open(f"screenshots/screenshot_{tool_use_id}.png", "wb") as f:
+                f.write(base64.b64decode(image_data))
+            print(f"Took screenshot screenshot_{tool_use_id}.png")
+
+    def api_response_callback(response: APIResponse[BetaMessage]):
+        print(
+            "\n---------------\nAPI Response:\n",
+            json.dumps(json.loads(response.text)["content"], indent=4),  # type: ignore
+            "\n",
+        )
+
+    # Run the sampling loop
+    messages = await sampling_loop(
+        model="claude-3-5-sonnet-20241022",
+        provider=provider,
+        system_prompt_suffix="",
+        messages=messages,
+        output_callback=output_callback,
+        tool_output_callback=tool_output_callback,
+        api_response_callback=api_response_callback,
+        api_key=api_key,
+        only_n_most_recent_images=10,
+        max_tokens=4096,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"Encountered Error:\n{e}")
+
+```
