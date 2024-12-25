@@ -11,12 +11,22 @@ from Cocoa import (
     NSMakeRect,
     NSVariableStatusItemLength,
     NSImage,
-    NSSize
+    NSSize,
+    NSScrollView,
+    NSTextView,
+    NSBezelBorder,
+    NSViewHeightSizable,
+    NSViewWidthSizable,
+    NSFont,
+    NSButton,
+    NSButtonTypeSwitch
 )
 from PyObjCTools.AppHelper import runEventLoop
 import subprocess
 import os
 from LLM_wrappers.openai_wrapper import OpenAIChat
+
+global_assistant = OpenAIChat(model="gpt-4o")
 
 class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, notification):
@@ -34,9 +44,29 @@ class AppDelegate(NSObject):
         else:
             # Fallback if icon not found: just use text
             self.statusItem.button().setTitle_("Menu")
-
-        # 3. Create the dropdown menu
+        
+        # Create the dropdown menu
         menu = NSMenu.alloc().init()
+
+        # Add chat history view
+        chatHistoryItem = NSMenuItem.alloc().init()
+        
+        # Create scroll view to contain the chat
+        scrollView = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 400))
+        scrollView.setBorderType_(NSBezelBorder)
+        scrollView.setHasVerticalScroller_(True)
+        
+        # Create text view for chat history
+        self.chatView = NSTextView.alloc().initWithFrame_(scrollView.contentView().frame())
+        self.chatView.setEditable_(False)
+        self.chatView.setFont_(NSFont.systemFontOfSize_(12))
+        
+        # Configure scroll view
+        scrollView.setDocumentView_(self.chatView)
+        chatHistoryItem.setView_(scrollView)
+        
+        # Add chat history to menu
+        menu.addItem_(chatHistoryItem)
 
         # 4. Create an NSMenuItem that holds an NSTextField
         textFieldItem = NSMenuItem.alloc().init()
@@ -65,22 +95,54 @@ class AppDelegate(NSObject):
         # 9. Assign this menu to our status item
         self.statusItem.setMenu_(menu)
 
+        # 10. Initialise LLM
+        self.assistant = global_assistant
+        self.send_ss = False
+
+        # 11. Add checkbox for ss
+        checkboxItem = NSMenuItem.alloc().init()
+        self.checkbox = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 200, 22))  # Store reference in self.checkbox
+        self.checkbox.setButtonType_(NSButtonTypeSwitch)  # Set the button type to a checkbox
+        self.checkbox.setTitle_("Add screen context")
+        self.checkbox.setState_(0)  # 0 means unchecked by default
+        self.checkbox.setTarget_(self)
+        self.checkbox.setAction_("toggleCheckbox:")  # Define action for checkbox toggle
+
+        # Embed the checkbox in the NSMenuItem
+        checkboxItem.setView_(self.checkbox)
+        # Add the checkbox item to the menu
+        menu.addItem_(checkboxItem)
+    
+    def toggleCheckbox_(self, sender):
+        if sender.state():
+            self.send_ss = True
+        else:
+            self.send_ss = False
+
     def submitText_(self, sender):
-        userInput = sender.stringValue()
-        print(f"Submitted text: {userInput}")
-        # Close the menu
-        self.statusItem.menu().cancelTracking()
+        user_input = sender.stringValue()
         # Clear the text field
         sender.setStringValue_("")
-        # Take a ss
-        ss_path = self.take_screenshot()
-        # TODO: send ss to llm with text to figure out what to do
-
-        # Example usage
-        self.send_to_llm(ss_path, userInput, model="gpt-4o")
         
-        # TODO: Delete ss
-    
+        # Add user message to chat
+        # self.append_to_chat(user_input, "user")
+        
+        if self.send_ss:
+            # TODO:Close the menu
+            # problem with below is that it wasn't closing before the ss.
+            # self.statusItem.menu().cancelTracking()
+            # TODO: Reopen the dropdown menu
+            ss_path = self.take_screenshot()
+            response = self.assistant.chat(user_input, image_path=ss_path)
+            # TODO: Delete ss
+        else:
+            response = self.assistant.chat(user_input)
+        # self.append_to_chat(response, "assistant")
+        if self.checkbox:
+            self.checkbox.setState_(0)  # Uncheck the checkbox
+            self.send_ss = False
+        self.append_to_chat()
+
     def take_screenshot(self, output_path=os.path.join(os.path.dirname(__file__), "temp_ss.png")):
         """
         Takes a screenshot of the entire screen on macOS
@@ -88,24 +150,18 @@ class AppDelegate(NSObject):
         """
         subprocess.run(["screencapture", output_path])
         return output_path
-    
-    def send_to_llm(self, screenshot_path, text, model="gpt-4o"):
-        if model == "gpt-4o":
-            # Code to send to gpt-4o
-            pass
-        elif model == "o1":
-            # Code to send to o1
-            pass
-        elif model == "sonnet-3.5":
-            # Code to send to sonnet-3.5
-            pass
-        else:
-            raise ValueError(f"Unsupported model: {model}")
 
     def quitApp_(self, sender):
         # Remove the status item before terminating
         NSStatusBar.systemStatusBar().removeStatusItem_(self.statusItem)
         NSApp.terminate_(self)
+
+    def append_to_chat(self):
+        """Synchronize displayed chat with global_assistant history"""
+        # global_assistant.conversation_history.append({"role": sender, "content": message})
+        chat_text = "\n\n".join([f"{msg['role']}: {msg['content']}" for msg in global_assistant.conversation_history])
+        self.chatView.setString_(chat_text)
+        self.chatView.scrollRangeToVisible_((len(chat_text), 0))
 
 def main():
     app = NSApplication.sharedApplication()

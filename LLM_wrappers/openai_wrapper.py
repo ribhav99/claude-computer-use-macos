@@ -60,6 +60,10 @@ class OpenAIChat:
 if __name__ == "__main__":
     chat_instance = OpenAIChat(model="gpt-4")
     response = chat_instance.chat("Hello, how are you?")
-    print(response)
+    print(response + '\n\n\n')
     response = chat_instance.chat("what do you see?", image_path="/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/temp_ss.png")
-    print(response)
+    print(response + '\n\n\n')
+    response = chat_instance.chat("what was my previous message?", image_path="/Users/ribhavkapur/Desktop/everything/omega_labs/agents/claude-computer-use-macos/temp_ss.png")
+    print(response + '\n\n\n')
+    response = chat_instance.chat("do you have context of our previous messages? if so, what was my first question and what was my second question?")
+    print(response + '\n\n\n')
